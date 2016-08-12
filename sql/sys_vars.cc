@@ -829,12 +829,17 @@ static Sys_var_enum Sys_binlog_format(
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(binlog_format_check),
        ON_UPDATE(fix_binlog_format_after_update));
 
-static const char *binlog_row_image_names[]= {"MINIMAL", "NOBLOB", "FULL", NullS};
+static const char *binlog_row_image_names[]=
+       {"MINIMAL", "NOBLOB", "FULL", "COMPLETE", NullS};
+
 static Sys_var_enum Sys_binlog_row_image(
        "binlog_row_image",
-       "Controls whether rows should be logged in 'FULL', 'NOBLOB' or "
-       "'MINIMAL' formats. 'FULL', means that all columns in the before "
-       "and after image are logged. 'NOBLOB', means that mysqld avoids logging "
+       "Controls whether rows should be logged in 'FULL', 'COMPLETE',"
+       "'NOBLOB' or 'MINIMAL' formats. 'FULL', means that all columns "
+       "in the before and after image are logged. 'COMPLETE', means "
+       "that all columns in the before "
+       "and only changed columns in the after image are logged."
+       "'NOBLOB', means that mysqld avoids logging "
        "blob columns whenever possible (eg, blob column was not changed or "
        "is not part of primary key). 'MINIMAL', means that a PK equivalent (PK "
        "columns or full row if there is no PK in the table) is logged in the "
@@ -844,6 +849,17 @@ static Sys_var_enum Sys_binlog_row_image(
        binlog_row_image_names, DEFAULT(BINLOG_ROW_IMAGE_FULL),
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(NULL),
        ON_UPDATE(NULL));
+
+static const char *session_track_gtids_names[]=
+{ "OFF", "OWN_GTID", /*"ALL_GTIDS",*/ NullS };
+static Sys_var_enum Sys_session_track_gtids(
+    "session_track_gtids",
+    "Controls the amount of global transaction ids to be "
+    "included in the response packet sent by the server."
+    "(Default: OFF).",
+    SESSION_VAR(session_track_gtids), CMD_LINE(REQUIRED_ARG),
+    session_track_gtids_names, DEFAULT(OFF),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static bool binlog_direct_check(sys_var *self, THD *thd, set_var *var)
 {
@@ -1624,7 +1640,7 @@ static Sys_var_mybool Sys_gap_lock_write_log(
        SESSION_VAR(gap_lock_write_log), CMD_LINE(OPT_ARG),
        DEFAULT(false));
 
-static bool set_gap_lock_exception_list(sys_var *, THD *, enum_var_type)
+bool set_gap_lock_exception_list(sys_var *, THD *, enum_var_type)
 {
   if (!opt_gap_lock_exception_list)
     gap_lock_exception_list.clear();
@@ -2410,6 +2426,20 @@ static Sys_var_ulong Sys_optimizer_search_depth(
        "the system will automatically pick a reasonable value",
        SESSION_VAR(optimizer_search_depth), CMD_LINE(REQUIRED_ARG),
        VALID_RANGE(0, MAX_TABLES+1), DEFAULT(MAX_TABLES+1), BLOCK_SIZE(1));
+
+static Sys_var_ulong Sys_range_optimizer_max_mem_size(
+      "range_optimizer_max_mem_size",
+      "Maximum amount of memory used by the range optimizer "
+      "to allocate predicates during range analysis. "
+      "The larger the number, more memory may be consumed during "
+      "range analysis. If the value is too low to completed range "
+      "optimization of a query, index range scan will not be "
+      "considered for this query. A value of 0 means range optimizer "
+      "does not have any cap on memory. ",
+      SESSION_VAR(range_optimizer_max_mem_size),
+      CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULONG_MAX),
+      DEFAULT(1536000),
+      BLOCK_SIZE(1));
 
 static const char *optimizer_switch_names[]=
 {
@@ -3414,16 +3444,18 @@ static bool check_ssl(sys_var *self, THD *thd, set_var * var)
 
 static const char *protocol_mode_names[] =
 {
+  "",
   "MINIMAL_OBJECT_NAMES_IN_RESULT_SET_METADATA",
   NULL
 };
 
-static Sys_var_set Sys_protocol_mode(
+static Sys_var_enum Sys_protocol_mode(
       "protocol_mode",
-      "Syntax: protocol-mode=mode[,mode[,mode...]]. See the manual for the "
+      "Syntax: protocol-mode=mode. See the manual for the "
       "complete list of valid protocol modes",
       SESSION_VAR(protocol_mode), CMD_LINE(REQUIRED_ARG),
-      protocol_mode_names, DEFAULT(0), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+      protocol_mode_names, DEFAULT(PROTO_MODE_OFF), NO_MUTEX_GUARD,
+      NOT_IN_BINLOG);
 
 #endif
 
@@ -5487,3 +5519,23 @@ static Sys_var_uint Sys_select_into_file_fsync_timeout(
        "SELECT INTO OUTFILE",
        SESSION_VAR(select_into_file_fsync_timeout), CMD_LINE(OPT_ARG),
        VALID_RANGE(0, UINT_MAX), DEFAULT(0), BLOCK_SIZE(1));
+
+static bool check_read_only_error_msg_extra(
+    sys_var *self, THD *thd, set_var *var)
+{
+  if (!opt_readonly && !opt_super_readonly)
+  {
+    my_error(ER_VARIABLE_NOT_SETTABLE_WITHOUT_READ_ONLY,
+             MYF(0),
+             var->var->name.str);
+    return true;
+  }
+  return false;
+}
+static Sys_var_charptr Sys_read_only_error_msg_extra(
+       "read_only_error_msg_extra",
+       "Set this variable to print out extra error information, "
+       "which will be appended to read_only error messages.",
+       GLOBAL_VAR(opt_read_only_error_msg_extra), CMD_LINE(OPT_ARG),
+       IN_SYSTEM_CHARSET, DEFAULT(""), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       ON_CHECK(check_read_only_error_msg_extra));

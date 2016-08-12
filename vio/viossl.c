@@ -391,10 +391,16 @@ static size_t ssl_handshake_loop(Vio *vio, SSL *ssl,
     if (vio->ssl_is_nonblocking) {
       socket_errno = SOCKET_EWOULDBLOCK;
       switch (event) {
-        case VIO_IO_EVENT_READ:  DBUG_RETURN(VIO_SOCKET_WANT_READ);
-        case VIO_IO_EVENT_WRITE: DBUG_RETURN(VIO_SOCKET_WANT_WRITE);
-        default:                 DBUG_RETURN(VIO_SOCKET_ERROR);
+        case VIO_IO_EVENT_READ:
+          ret = VIO_SOCKET_WANT_READ;
+          break;
+        case VIO_IO_EVENT_WRITE:
+          ret = VIO_SOCKET_WANT_WRITE;
+          break;
+        default:
+          ret = VIO_SOCKET_ERROR;
       }
+      break;
     }
 
     /* Wait for I/O so that the handshake can proceed. */
@@ -451,7 +457,6 @@ static int ssl_init(SSL **out_ssl,
   }
 
   DBUG_PRINT("info", ("ssl: 0x%lx timeout: %ld", (long) ssl, timeout));
-  SSL_clear(ssl);
   SSL_SESSION_set_timeout(SSL_get_session(ssl), timeout);
   SSL_set_fd(ssl, sd);
 #if !defined(HAVE_YASSL) && defined(SSL_OP_NO_COMPRESSION)
@@ -616,7 +621,7 @@ static int ssl_do(struct st_VioSSLFd *ptr,
     DBUG_RETURN(-1);
   }
 
-  DBUG_PRINT("info", ("reused session: %ld", SSL_session_reused(ssl)));
+  DBUG_PRINT("info", ("reused session: %ld", (long)SSL_session_reused(ssl)));
   int r = ssl_finish(ssl, vio);
   DBUG_RETURN(r ? -1 : 0);
 }

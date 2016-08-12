@@ -127,6 +127,7 @@ const char 	*def_shared_memory_base_name= default_shared_memory_base_name;
 static void mysql_close_free_options(MYSQL *mysql);
 static void mysql_close_free(MYSQL *mysql);
 static void mysql_prune_stmt_list(MYSQL *mysql);
+static void mysql_close_free_connect_context(MYSQL *mysql);
 
 CHARSET_INFO *default_client_charset_info = &my_charset_latin1;
 
@@ -928,6 +929,7 @@ void free_old_query(MYSQL *mysql)
   mysql->field_count= 0;			/* For API */
   mysql->warning_count= 0;
   mysql->info= 0;
+  mysql->recv_gtid= NULL;
   DBUG_VOID_RETURN;
 }
 
@@ -1011,6 +1013,15 @@ my_bool opt_flush_ok_packet(MYSQL *mysql, my_bool *is_ok_packet)
     {
       mysql->warning_count=uint2korr(pos);
       pos+=2;
+    }
+
+    if (mysql->server_capabilities & CLIENT_SESSION_TRACK)
+    {
+      pos += net_field_length_ll(&pos); /* info string */
+      if (mysql->server_status & SERVER_SESSION_STATE_CHANGED)
+      {
+        pos += net_field_length_ll(&pos); /* gtid string */
+      }
     }
   }
   return FALSE;
@@ -3085,6 +3096,7 @@ static int send_change_user_packet_nonblocking(
     DBUG_RETURN(NET_ASYNC_NOT_READY);
   }
   my_free(ctx->change_user_buff);
+  ctx->change_user_buff = NULL;
 
   *result = error;
   DBUG_RETURN(NET_ASYNC_COMPLETE);
@@ -3527,6 +3539,7 @@ static net_async_status send_client_reply_packet_nonblocking(
 end:
   *result = error;
   my_free(ctx->change_user_buff);
+  ctx->change_user_buff = NULL;
 
   DBUG_RETURN(NET_ASYNC_COMPLETE);
 }
@@ -3913,6 +3926,7 @@ run_plugin_auth_nonblocking(MYSQL *mysql, char *data, uint data_len,
   if (ret == STATE_MACHINE_FAILED ||
       ret == STATE_MACHINE_DONE) {
     my_free(ctx);
+    mysql->connect_context->auth_context = NULL;
   }
 
   DBUG_RETURN(ret);
@@ -5488,6 +5502,18 @@ static void mysql_close_free(MYSQL *mysql)
   mysql->host_info= mysql->user= mysql->passwd= mysql->db= 0;
 }
 
+static void mysql_close_free_connect_context(MYSQL *mysql) {
+  if (mysql && mysql->connect_context) {
+    if (mysql->connect_context->auth_context) {
+      if (mysql->connect_context->auth_context->change_user_buff) {
+        my_free(mysql->connect_context->auth_context->change_user_buff);
+      }
+      my_free(mysql->connect_context->auth_context);
+    }
+    my_free(mysql->connect_context);
+    mysql->connect_context = NULL;
+  }
+}
 
 /**
   For use when the connection to the server has been lost (in which case 
@@ -5598,6 +5624,7 @@ void STDCALL mysql_close(MYSQL *mysql)
     if (mysql->thd)
       (*mysql->methods->free_embedded_thd)(mysql);
 #endif
+    mysql_close_free_connect_context(mysql);
     if (mysql->free_me)
       my_free(mysql);
   }
@@ -5640,8 +5667,22 @@ get_info:
     }
     DBUG_PRINT("info",("status: %u  warning_count: %u",
 		       mysql->server_status, mysql->warning_count));
-    if (pos < mysql->net.read_pos+length && net_field_length(&pos))
+    if (mysql->server_capabilities & CLIENT_SESSION_TRACK)
+    {
+      size_t info_len= net_field_length_ll(&pos); /* info string */
+      mysql->info= info_len ? (char*) pos : NULL;
+      pos+=info_len;
+      if (mysql->server_status & SERVER_SESSION_STATE_CHANGED)
+      {
+        size_t gtid_len= net_field_length_ll(&pos); /* gtid string */
+        mysql->recv_gtid=(char*) pos;
+        pos += gtid_len;
+      }
+    }
+    else if (pos < mysql->net.read_pos+length && net_field_length(&pos))
       mysql->info=(char*) pos;
+    DBUG_PRINT("info",("info: %s  gtid: %s",
+		       mysql->info, mysql->recv_gtid));
     DBUG_RETURN(0);
   }
 #ifdef MYSQL_CLIENT
@@ -5725,8 +5766,22 @@ get_info:
       }
       DBUG_PRINT("info",("status: %u  warning_count: %u",
                          mysql->server_status, mysql->warning_count));
-      if (pos < mysql->net.read_pos+length && net_field_length(&pos))
+      if (mysql->server_capabilities & CLIENT_SESSION_TRACK)
+      {
+        size_t info_len= net_field_length_ll(&pos); /* info string */
+        mysql->info= info_len ? (char*) pos : NULL;
+        pos+=info_len;
+        if (mysql->server_status & SERVER_SESSION_STATE_CHANGED)
+        {
+          size_t gtid_len= net_field_length_ll(&pos); /* gtid string */
+          mysql->recv_gtid=(char*) pos;
+          pos += gtid_len;
+        }
+      }
+      else if (pos < mysql->net.read_pos+length && net_field_length(&pos))
         mysql->info=(char*) pos;
+      DBUG_PRINT("info",("info: %s  gtid: %s",
+                 mysql->info, mysql->recv_gtid));
       DBUG_PRINT("exit",("ok"));
       *ret = 0;
       DBUG_RETURN(NET_ASYNC_COMPLETE);
@@ -6500,7 +6555,11 @@ mysql_options4(MYSQL *mysql,enum mysql_option option,
 
      // Increment the reference count
     if (!take_ownership && ssl_session != NULL)
+#ifdef OPENSSL_IS_BORINGSSL
+      SSL_SESSION_up_ref(ssl_session);
+#else
       CRYPTO_add(&ssl_session->references, 1, CRYPTO_LOCK_SSL_SESSION);
+#endif
 
     if (mysql->options.extension->ssl_session)
       SSL_SESSION_free((SSL_SESSION*)mysql->options.extension->ssl_session);

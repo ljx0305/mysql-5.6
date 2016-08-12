@@ -41,14 +41,41 @@ class Rdb_key_def;
 class Rdb_field_packing;
 class Rdb_cf_manager;
 class Rdb_ddl_manager;
-struct Rdb_make_unpack_field;
+
+/*
+  @brief
+  Field packing context.
+  The idea is to ensure that a call to rdb_index_field_pack_t function
+  is followed by a call to rdb_make_unpack_info_t.
+
+  @detail
+  For some datatypes, unpack_info is produced as a side effect of
+  rdb_index_field_pack_t function call.
+  For other datatypes, packing is just calling make_sort_key(), while
+  rdb_make_unpack_info_t is a custom function.
+  In order to accommodate both cases, we require both calls to be made and
+  unpack_info is passed as context data between the two.
+*/
+class Rdb_pack_field_context
+{
+ public:
+  explicit Rdb_pack_field_context(Rdb_string_writer *writer_arg) :
+    writer(writer_arg)
+  {}
+
+  // NULL means we're not producing unpack_info.
+  Rdb_string_writer *writer;
+};
+
+struct Rdb_collation_codec;
 
 /*
   C-style "virtual table" allowing different handling of packing logic based
   on the field type. See Rdb_field_packing::setup() implementation.
   */
-using rdb_make_unpack_info_t=  uint (*)(Rdb_make_unpack_field *upf,
-                                    const Field *field, uchar *dst);
+using rdb_make_unpack_info_t=  void (*)(const Rdb_collation_codec *codec,
+                                    const Field *field,
+                                    Rdb_pack_field_context *pack_ctx);
 using rdb_index_field_unpack_t= int (*)(Rdb_field_packing *fpi, Field *field,
                                     uchar *field_ptr,
                                     Rdb_string_reader *reader,
@@ -57,7 +84,8 @@ using rdb_index_field_skip_t=   int (*)(const Rdb_field_packing *fpi,
                                     const Field *field,
                                     Rdb_string_reader *reader);
 using rdb_index_field_pack_t=  void (*)(Rdb_field_packing *fpi, Field *field,
-                                    uchar* buf, uchar **dst);
+                                    uchar* buf, uchar **dst,
+                                    Rdb_pack_field_context *pack_ctx);
 
 const uint RDB_INVALID_KEY_LEN= uint(-1);
 
@@ -140,9 +168,9 @@ public:
                         const uchar *key_tuple, key_part_map keypart_map) const;
 
   /* Convert a key from Table->record format to mem-comparable form */
-  uint pack_record(TABLE *tbl, uchar *pack_buffer, const uchar *record,
-                   uchar *packed_tuple, uchar *unpack_info,
-                   int *unpack_info_len, bool should_store_checksums,
+  uint pack_record(const TABLE *tbl, uchar *pack_buffer, const uchar *record,
+                   uchar *packed_tuple, Rdb_string_writer *unpack_info,
+                   bool should_store_checksums,
                    longlong hidden_pk_id= 0, uint n_key_parts= 0,
                    uint *n_null_fields= nullptr) const;
   /* Pack the hidden primary key into mem-comparable form. */
@@ -210,6 +238,11 @@ public:
                             const rocksdb::Slice &prefix) const
   {
     return covers_key(value) && !cmp_full_keys(value, prefix);
+  }
+
+  uint32 get_keyno() const
+  {
+    return m_keyno;
   }
 
   uint32 get_index_number() const
@@ -289,6 +322,7 @@ public:
     DDL_DROP_INDEX_ONGOING=       5,
     INDEX_STATISTICS=             6,
     MAX_INDEX_ID=                 7,
+    DDL_CREATE_INDEX_ONGOING=     8,
     END_DICT_INDEX_ID=          255
   };
 
@@ -300,6 +334,7 @@ public:
     BINLOG_INFO_INDEX_NUMBER_VERSION= 1,
     DDL_DROP_INDEX_ONGOING_VERSION= 1,
     MAX_INDEX_ID_VERSION= 1,
+    DDL_CREATE_INDEX_ONGOING_VERSION= 1,
     // Version for index stats is stored in IndexStats struct
   };
 
@@ -315,9 +350,8 @@ public:
     // bump is needed to prevent older binaries from skipping the KV version
     // check inadvertently.
     INDEX_INFO_VERSION_VERIFY_KV_FORMAT,
-    // This should point to latest. For now, we are still on the old format,
-    // but we want to "upgrade" eventually.
-    INDEX_INFO_VERSION_LATEST= INDEX_INFO_VERSION_GLOBAL_ID,
+    // This normally point to the latest (currently it does).
+    INDEX_INFO_VERSION_LATEST= INDEX_INFO_VERSION_VERIFY_KV_FORMAT,
   };
 
   // MyRocks index types
@@ -335,16 +369,17 @@ public:
     //    stores the unpack_info.
     //  - DECIMAL datatype is no longer stored in the row (because
     //    it can be decoded from its mem-comparable form)
+    //  - VARCHAR-columns use endspace-padding.
     PRIMARY_FORMAT_VERSION_UPDATE1= 11,
-    PRIMARY_FORMAT_VERSION_LATEST= PRIMARY_FORMAT_VERSION_INITIAL,
+    PRIMARY_FORMAT_VERSION_LATEST= PRIMARY_FORMAT_VERSION_UPDATE1,
 
     SECONDARY_FORMAT_VERSION_INITIAL= 10,
     // This change the SK format to include unpack_info.
-    SECONDARY_FORMAT_VERSION_UNPACK_INFO= 11,
-    SECONDARY_FORMAT_VERSION_LATEST= SECONDARY_FORMAT_VERSION_INITIAL,
+    SECONDARY_FORMAT_VERSION_UPDATE1= 11,
+    SECONDARY_FORMAT_VERSION_LATEST= SECONDARY_FORMAT_VERSION_UPDATE1,
   };
 
-  void setup(TABLE *table, Rdb_tbl_def *tbl_def);
+  void setup(const TABLE *table, const Rdb_tbl_def *tbl_def);
 
   rocksdb::ColumnFamilyHandle *get_cf() const { return m_cf_handle; }
 
@@ -352,7 +387,6 @@ public:
   inline bool can_unpack(uint kp) const;
   /* Check if keypart #kp needs unpack info */
   inline bool has_unpack_info(uint kp) const;
-  inline Rdb_make_unpack_field get_make_unpack_field(uint kp) const;
 
   /* Check if given table has a primary key */
   static bool table_has_hidden_pk(const TABLE* table);
@@ -443,6 +477,7 @@ private:
 struct Rdb_collation_codec
 {
   const my_core::CHARSET_INFO *m_cs;
+  // The first element unpacks VARCHAR(n), the second one - CHAR(n).
   std::array<rdb_make_unpack_info_t, 2> m_make_unpack_info_func;
   std::array<rdb_index_field_unpack_t, 2> m_unpack_func;
 
@@ -454,14 +489,10 @@ struct Rdb_collation_codec
 };
 
 extern mysql_mutex_t rdb_collation_data_mutex;
+extern mysql_mutex_t rdb_mem_cmp_space_mutex;
 extern std::array<const Rdb_collation_codec*, MY_ALL_CHARSETS_SIZE>
   rdb_collation_data;
 
-struct Rdb_make_unpack_field
-{
-  const Rdb_collation_codec* m_charset_codec;
-  rdb_make_unpack_info_t m_make_unpack_info_func;
-};
 
 class Rdb_field_packing
 {
@@ -479,9 +510,33 @@ public:
     Valid only for VARCHAR fields.
   */
   const CHARSET_INFO *m_varchar_charset;
-  struct Rdb_make_unpack_field m_make_unpack_field;
+
+  // (Valid when Variable Length Space Padded Encoding is used):
+  uint m_segment_size;  // size of segment used
+
+  // number of bytes used to store number of trimmed (or added)
+  // spaces in the upack_info
+  bool m_unpack_info_uses_two_bytes;
+
+  const std::vector<uchar>* space_xfrm;
+  size_t space_xfrm_len;
+  size_t space_mb_len;
+
+  const Rdb_collation_codec* m_charset_codec;
+
+  /*
+    @return TRUE: this field makes use of unpack_info.
+  */
+  bool uses_unpack_info() const
+  {
+    return (m_make_unpack_info_func != nullptr);
+  }
+
+  /* TRUE means unpack_info stores the original field value */
+  bool m_unpack_info_stores_value;
 
   rdb_index_field_pack_t m_pack_func;
+  rdb_make_unpack_info_t m_make_unpack_info_func;
 
   /*
     This function takes
@@ -524,7 +579,7 @@ private:
 public:
   bool setup(const Rdb_key_def *key_descr, const Field *field,
              uint keynr_arg, uint key_part_arg, uint16 key_length);
-  Field *get_field_in_table(TABLE *tbl) const;
+  Field *get_field_in_table(const TABLE *tbl) const;
   void fill_hidden_pk_val(uchar **dst, longlong hidden_pk_id) const;
 };
 
@@ -569,8 +624,6 @@ class Rdb_field_encoder
     return (m_field_type == MYSQL_TYPE_BLOB ||
             m_field_type == MYSQL_TYPE_VARCHAR);
   }
-
-  struct Rdb_make_unpack_field m_make_unpack_field;
 };
 
 inline Field* Rdb_key_def::get_table_field_for_part_no(TABLE *table,
@@ -589,16 +642,9 @@ inline bool Rdb_key_def::can_unpack(uint kp) const
 inline bool Rdb_key_def::has_unpack_info(uint kp) const
 {
   DBUG_ASSERT(kp < m_key_parts);
-  return (m_pack_info[kp].
-          m_make_unpack_field.
-          m_make_unpack_info_func != nullptr);
+  return m_pack_info[kp].uses_unpack_info();
 }
 
-inline Rdb_make_unpack_field Rdb_key_def::get_make_unpack_field(uint kp) const
-{
-  DBUG_ASSERT(has_unpack_info(kp));
-  return m_pack_info[kp].m_make_unpack_field;
-}
 
 /*
   A table definition. This is an entry in the mapping
@@ -620,7 +666,7 @@ public:
   ~Rdb_tbl_def();
 
   /* Stores 'dbname.tablename' */
-  StringBuffer<64> m_dbname_tablename;
+  std::string m_dbname_tablename;
 
   /* Number of indexes */
   uint m_key_count;
@@ -637,7 +683,10 @@ public:
   bool put_dict(Rdb_dict_manager *dict, rocksdb::WriteBatch *batch,
                 uchar *key, size_t keylen);
 
-  void set_name(const char *name, size_t len);
+  void set_name(const char *name, size_t len) {
+    set_name(std::string(name, len));
+  }
+  void set_name(const std::string& name);
   void set_name(const rocksdb::Slice& slice, size_t pos = 0) {
     set_name(slice.data() + pos, slice.size() - pos);
   }
@@ -689,8 +738,7 @@ class Rdb_ddl_manager
   Rdb_dict_manager *m_dict= nullptr;
   my_core::HASH m_ddl_hash;  // Contains Rdb_tbl_def elements
   // maps index id to <table_name, index number>
-  std::map<GL_INDEX_ID, std::pair<std::basic_string<uchar>, uint>>
-    m_index_num_to_keydef;
+  std::map<GL_INDEX_ID, std::pair<std::string, uint>> m_index_num_to_keydef;
   mysql_rwlock_t m_rwlock;
 
   Rdb_seq_generator m_sequence;
@@ -705,7 +753,7 @@ public:
 
   void cleanup();
 
-  Rdb_tbl_def* find(const uchar *table_name, uint len, bool lock= true);
+  Rdb_tbl_def* find(const std::string& table_name, bool lock= true);
   const std::shared_ptr<Rdb_key_def>& find(GL_INDEX_ID gl_index_id);
   std::shared_ptr<Rdb_key_def> safe_find(GL_INDEX_ID gl_index_id);
   void set_stats(
@@ -719,7 +767,7 @@ public:
   /* Modify the mapping and write it to on-disk storage */
   int put_and_write(Rdb_tbl_def *key_descr, rocksdb::WriteBatch *batch);
   void remove(Rdb_tbl_def *rec, rocksdb::WriteBatch *batch, bool lock= true);
-  bool rename(uchar *from, uint from_len, uchar *to, uint to_len,
+  bool rename(const std::string& from, const std::string& to,
               rocksdb::WriteBatch *batch);
 
   uint get_and_update_next_number(Rdb_dict_manager *dict)
@@ -735,8 +783,8 @@ private:
   int put(Rdb_tbl_def *key_descr, bool lock= true);
 
   /* Helper functions to be passed to my_core::HASH object */
-  static uchar* get_hash_key(Rdb_tbl_def *rec, size_t *length,
-                             my_bool not_used __attribute__((unused)));
+  static const uchar* get_hash_key(Rdb_tbl_def *rec, size_t *length,
+                                   my_bool not_used __attribute__((unused)));
   static void free_hash_elem(void* data);
 
   bool validate_schemas();
@@ -826,7 +874,11 @@ private:
   value: index_id
   index_id is 4 bytes
 
-   Data dictionary operations are atomic inside RocksDB. For example,
+  8. Ongoing create index entry
+  key: Rdb_key_def::DDL_CREATE_INDEX_ONGOING(0x8) + cf_id + index_id
+  value: version
+
+  Data dictionary operations are atomic inside RocksDB. For example,
   when creating a table with two indexes, it is necessary to call Put
   three times. They have to be atomic. Rdb_dict_manager has a wrapper function
   begin() and commit() to make it easier to do atomic operations.
@@ -903,19 +955,73 @@ public:
                     const uint cf_flags);
   bool get_cf_flags(const uint cf_id, uint *cf_flags);
 
-  /* Functions for fast DROP TABLE/INDEX */
-  void get_drop_indexes_ongoing(std::vector<GL_INDEX_ID> *gl_index_ids);
-  bool is_drop_index_ongoing(GL_INDEX_ID gl_index_id);
-  void start_drop_index_ongoing(rocksdb::WriteBatch* batch,
-                                GL_INDEX_ID gl_index_id);
-  void end_drop_index_ongoing(rocksdb::WriteBatch* batch,
-                              GL_INDEX_ID gl_index_id);
+  /* Functions for fast CREATE/DROP TABLE/INDEX */
+  void get_ongoing_index_operation(std::vector<GL_INDEX_ID>* gl_index_ids,
+                                   Rdb_key_def::DATA_DICT_TYPE dd_type);
+  bool is_index_operation_ongoing(const GL_INDEX_ID& gl_index_id,
+                                  Rdb_key_def::DATA_DICT_TYPE dd_type);
+  void start_ongoing_index_operation(rocksdb::WriteBatch* batch,
+                                     const GL_INDEX_ID& gl_index_id,
+                                     Rdb_key_def::DATA_DICT_TYPE dd_type);
+  void end_ongoing_index_operation(rocksdb::WriteBatch* batch,
+                                   const GL_INDEX_ID& gl_index_id,
+                                   Rdb_key_def::DATA_DICT_TYPE dd_type);
   bool is_drop_index_empty();
   void add_drop_table(std::shared_ptr<Rdb_key_def>* key_descr, uint32 n_keys,
                       rocksdb::WriteBatch *batch);
   void add_drop_index(const std::unordered_set<GL_INDEX_ID>& gl_index_ids,
                       rocksdb::WriteBatch *batch);
-  void done_drop_indexes(const std::unordered_set<GL_INDEX_ID>& gl_index_ids);
+  void add_create_index(const std::unordered_set<GL_INDEX_ID>& gl_index_ids,
+                        rocksdb::WriteBatch *batch);
+  void finish_indexes_operation(
+      const std::unordered_set<GL_INDEX_ID>& gl_index_ids,
+      Rdb_key_def::DATA_DICT_TYPE dd_type);
+  void rollback_ongoing_index_creation();
+
+  inline void get_ongoing_drop_indexes(std::vector<GL_INDEX_ID>* gl_index_ids)
+  {
+    get_ongoing_index_operation(gl_index_ids,
+                                Rdb_key_def::DDL_DROP_INDEX_ONGOING);
+  }
+  inline void get_ongoing_create_indexes(std::vector<GL_INDEX_ID>* gl_index_ids)
+  {
+    get_ongoing_index_operation(gl_index_ids,
+                                Rdb_key_def::DDL_CREATE_INDEX_ONGOING);
+  }
+  inline void start_drop_index(rocksdb::WriteBatch *wb,
+                               const GL_INDEX_ID&  gl_index_id)
+  {
+    start_ongoing_index_operation(wb, gl_index_id,
+                                  Rdb_key_def::DDL_DROP_INDEX_ONGOING);
+  }
+  inline void start_create_index(rocksdb::WriteBatch *wb,
+                                 const GL_INDEX_ID& gl_index_id)
+  {
+    start_ongoing_index_operation(wb, gl_index_id,
+                                  Rdb_key_def::DDL_CREATE_INDEX_ONGOING);
+  }
+  inline void finish_drop_indexes(
+      const std::unordered_set<GL_INDEX_ID>& gl_index_ids)
+  {
+    finish_indexes_operation(gl_index_ids,
+                             Rdb_key_def::DDL_DROP_INDEX_ONGOING);
+  }
+  inline void finish_create_indexes(
+      const std::unordered_set<GL_INDEX_ID>& gl_index_ids)
+  {
+    finish_indexes_operation(gl_index_ids,
+                             Rdb_key_def::DDL_CREATE_INDEX_ONGOING);
+  }
+  inline bool is_drop_index_ongoing(const GL_INDEX_ID& gl_index_id)
+  {
+    return is_index_operation_ongoing(gl_index_id,
+                                      Rdb_key_def::DDL_DROP_INDEX_ONGOING);
+  }
+  inline bool is_create_index_ongoing(const GL_INDEX_ID& gl_index_id)
+  {
+    return is_index_operation_ongoing(gl_index_id,
+                                      Rdb_key_def::DDL_CREATE_INDEX_ONGOING);
+  }
 
   bool get_max_index_id(uint32_t *index_id);
   bool update_max_index_id(rocksdb::WriteBatch* batch,

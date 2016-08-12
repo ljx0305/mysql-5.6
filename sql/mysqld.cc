@@ -20,6 +20,8 @@
 #include <functional>
 #include <list>
 #include <set>
+#include <cmath>
+#include <cstring>
 
 #include "sql_priv.h"
 #include "unireg.h"
@@ -479,7 +481,6 @@ my_bool opt_show_slave_auth_info;
 my_bool opt_log_slave_updates= 0;
 char *opt_slave_skip_errors;
 char *opt_rbr_idempotent_tables;
-std::unordered_set<std::string> rbr_idempotent_tables;
 my_bool opt_slave_allow_batching= 0;
 
 /**
@@ -503,6 +504,7 @@ my_bool block_create_myisam = FALSE;
 my_bool block_create_memory = FALSE;
 my_bool block_create_no_primary_key = FALSE;
 my_bool read_only= 0, opt_readonly= 0;
+char* opt_read_only_error_msg_extra;
 my_bool super_read_only = 0, opt_super_readonly = 0;
 my_bool use_temp_pool, relay_log_purge;
 my_bool relay_log_recovery;
@@ -538,8 +540,11 @@ ulonglong relay_sql_wait_time= 0;
 /* status variables for binlog fsync histogram */
 SHOW_VAR latency_histogram_binlog_fsync[NUMBER_OF_HISTOGRAM_BINS + 1];
 ulonglong histogram_binlog_fsync_values[NUMBER_OF_HISTOGRAM_BINS];
-SHOW_VAR histogram_binlog_group_commit_var[NUMBER_OF_HISTOGRAM_BINS + 1];
-ulonglong histogram_binlog_group_commit_values[NUMBER_OF_HISTOGRAM_BINS];
+
+SHOW_VAR
+  histogram_binlog_group_commit_var[NUMBER_OF_COUNTER_HISTOGRAM_BINS + 1];
+ulonglong
+  histogram_binlog_group_commit_values[NUMBER_OF_COUNTER_HISTOGRAM_BINS];
 
 uint net_compression_level = 6;
 
@@ -2084,7 +2089,7 @@ void clean_up(bool print_message)
   memcached_shutdown();
 
   free_latency_histogram_sysvars(latency_histogram_binlog_fsync);
-  free_latency_histogram_sysvars(histogram_binlog_group_commit_var);
+  free_counter_histogram_sysvars(histogram_binlog_group_commit_var);
 
   /*
     make sure that handlers finish up
@@ -3447,16 +3452,23 @@ void my_io_perf_sum_atomic(
 void latency_histogram_init(latency_histogram* current_histogram,
                     const char *step_size_with_unit)
 {
-  size_t i;
+  assert (current_histogram != 0);
+
   double step_size_base_time = 0.0;
   current_histogram->num_bins = NUMBER_OF_HISTOGRAM_BINS;
+
+  // this can potentially be made configurable later.
+  current_histogram->step_ratio = 2.0;
+  current_histogram->step_size = 0;
   char *histogram_unit = NULL;
 
-  if (step_size_with_unit)
-    step_size_base_time = strtod(step_size_with_unit, &histogram_unit);
-  else
-    current_histogram->step_size = 0;
+  std::memset(current_histogram->count_per_bin,
+      0, sizeof(ulonglong)*NUMBER_OF_HISTOGRAM_BINS);
 
+  if (!step_size_with_unit)
+    return;
+
+  step_size_base_time = strtod(step_size_with_unit, &histogram_unit);
   if (histogram_unit)  {
     if (!strcmp(histogram_unit, "s"))  {
       current_histogram->step_size = microseconds_to_my_timer(
@@ -3471,18 +3483,23 @@ void latency_histogram_init(latency_histogram* current_histogram,
                                               step_size_base_time);
     }
     /* Special case when step size is passed to be '0' */
-    else if (*histogram_unit == '\0' && step_size_base_time == 0.0)
-      current_histogram->step_size = 0;
+    else if (*histogram_unit == '\0') {
+      if (step_size_base_time == 0.0) {
+        current_histogram->step_size = 0;
+      }
+      else
+        current_histogram->step_size =
+          microseconds_to_my_timer(step_size_base_time);
+    }
     else  {
-      current_histogram->step_size = 0;
       sql_print_error("Invalid units given to histogram step size.");
       return;
     }
+  } else {
+    /* NO_LINT_DEBUG */
+    sql_print_error("Invalid histogram step size.");
+    return;
   }
-
-  for (i = 0; i < current_histogram->num_bins; ++i)
-    (current_histogram->count_per_bin)[i] = 0;
-
 }
 
 /**
@@ -3492,11 +3509,12 @@ void latency_histogram_init(latency_histogram* current_histogram,
 void counter_histogram_init(counter_histogram* current_histogram,
                             ulonglong step_size)
 {
-  current_histogram->num_bins = NUMBER_OF_HISTOGRAM_BINS;
+  current_histogram->num_bins = NUMBER_OF_COUNTER_HISTOGRAM_BINS;
   current_histogram->step_size = step_size;
   for (size_t i = 0; i < current_histogram->num_bins; ++i)
     (current_histogram->count_per_bin)[i] = 0;
 }
+
 /**
   Search a value in the histogram bins.
 
@@ -3507,6 +3525,32 @@ void counter_histogram_init(counter_histogram* current_histogram,
                             -1 if Step Size is 0
 */
 static int latency_histogram_bin_search(latency_histogram* current_histogram,
+                         ulonglong value)
+{
+  if (current_histogram->step_size == 0 || value == 0
+    || current_histogram->step_ratio <= 0.0)
+    return -1;
+
+  double dbin_no = std::log2((double)value / current_histogram->step_size) /
+      std::log2(current_histogram->step_ratio);
+
+  int ibin_no = (int)dbin_no;
+  if (ibin_no < 0)
+    return 0;
+
+  return min(ibin_no, (int)current_histogram->num_bins - 1);
+}
+
+/**
+  Search a value in the histogram bins.
+
+  @param current_histogram  The current histogram.
+  @param value              Value to be searched.
+
+  @return                   Returns the bin that contains this value.
+                            -1 if Step Size is 0
+*/
+static int counter_histogram_bin_search(counter_histogram* current_histogram,
                          const ulonglong value)
 {
   if (current_histogram->step_size == 0)
@@ -3544,7 +3588,7 @@ void latency_histogram_increment(latency_histogram* current_histogram,
 void counter_histogram_increment(counter_histogram* current_histogram,
                                  ulonglong value)
 {
-  int index = latency_histogram_bin_search(current_histogram, value - 1);
+  int index = counter_histogram_bin_search(current_histogram, value);
   if (index >= 0)
     my_atomic_add64((longlong*)&((current_histogram->count_per_bin)[index]), 1);
 }
@@ -3609,16 +3653,17 @@ histogram_bucket_to_display_string(ulonglong bucket_lower_display,
                                    ulonglong bucket_upper_display)
 {
   struct histogram_display_string histogram_bucket_name;
-  ulonglong step_size = bucket_upper_display - bucket_lower_display;
 
-  if ((step_size % 1000000) == 0)
+  if ((bucket_upper_display % 1000000) == 0 &&
+      (bucket_lower_display % 1000000) == 0)
   {
     my_snprintf(histogram_bucket_name.name,
                 HISTOGRAM_BUCKET_NAME_MAX_SIZE, "%llu-%llus",
                 bucket_lower_display/1000000,
                 bucket_upper_display/1000000);
   }
-  else if ((step_size % 1000) == 0)
+  else if ((bucket_upper_display % 1000) == 0 &&
+           (bucket_lower_display % 1000) == 0)
   {
     my_snprintf(histogram_bucket_name.name,
                 HISTOGRAM_BUCKET_NAME_MAX_SIZE, "%llu-%llums",
@@ -3649,6 +3694,19 @@ void free_latency_histogram_sysvars(SHOW_VAR* latency_histogram_data)
 }
 
 /**
+   Frees old histogram bucket display strings before assigning new ones.
+*/
+void free_counter_histogram_sysvars(SHOW_VAR* counter_histogram_data)
+{
+  size_t i;
+  for (i = 0; i < NUMBER_OF_COUNTER_HISTOGRAM_BINS; ++i)
+  {
+    if (counter_histogram_data[i].name)
+      my_free((void*)counter_histogram_data[i].name);
+  }
+}
+
+/**
   This function is called by the Callback function show_innodb_vars()
   to add entries into the latency_histogram_xxxx array, by forming
   the appropriate display string and fetching the histogram bin
@@ -3671,10 +3729,11 @@ void prepare_latency_histogram_vars(latency_histogram* current_histogram,
 
   free_latency_histogram_sysvars(latency_histogram_data);
 
+  ulonglong itr_step_size = current_histogram->step_size;
   for (i = 0, bucket_lower_display = 0; i < NUMBER_OF_HISTOGRAM_BINS; ++i)
   {
     bucket_upper_display =
-      my_timer_to_microseconds_ulonglong(current_histogram->step_size)
+      my_timer_to_microseconds_ulonglong(itr_step_size)
       + bucket_lower_display;
 
     struct histogram_display_string histogram_bucket_name =
@@ -3686,10 +3745,11 @@ void prepare_latency_histogram_vars(latency_histogram* current_histogram,
     latency_histogram_data[i] = temp;
 
     bucket_lower_display = bucket_upper_display;
+    itr_step_size *= current_histogram->step_ratio;
   }
-  latency_histogram_data[NUMBER_OF_HISTOGRAM_BINS] =
-  temp_last;
+  latency_histogram_data[NUMBER_OF_HISTOGRAM_BINS] = temp_last;
 }
+
 
 /**
   Prepares counter histogram to display in SHOW STATUS
@@ -3702,10 +3762,10 @@ void prepare_counter_histogram_vars(counter_histogram *current_histogram,
                                     ulonglong* histogram_values)
 {
   ulonglong bucket_lower_display=0, bucket_upper_display;
-  free_latency_histogram_sysvars(counter_histogram_data);
+  free_counter_histogram_sysvars(counter_histogram_data);
   const SHOW_VAR temp_last = {NullS, NullS, SHOW_LONG};
 
-  for (size_t i=0; i < NUMBER_OF_HISTOGRAM_BINS; ++i)
+  for (size_t i=0; i < NUMBER_OF_COUNTER_HISTOGRAM_BINS; ++i)
   {
     bucket_upper_display = current_histogram->step_size + bucket_lower_display;
 
@@ -3719,7 +3779,7 @@ void prepare_counter_histogram_vars(counter_histogram *current_histogram,
     counter_histogram_data[i] = temp;
     bucket_lower_display = bucket_upper_display;
   }
-  counter_histogram_data[NUMBER_OF_HISTOGRAM_BINS] = temp_last;
+  counter_histogram_data[NUMBER_OF_COUNTER_HISTOGRAM_BINS] = temp_last;
 }
 
 
@@ -9183,7 +9243,7 @@ static int show_latency_histogram_binlog_fsync(THD *thd, SHOW_VAR *var,
 static int show_histogram_binlog_group_commit(THD *thd, SHOW_VAR* var,
                                               char *buff)
 {
-  for (int i = 0; i < NUMBER_OF_HISTOGRAM_BINS; ++i)
+  for (int i = 0; i < NUMBER_OF_COUNTER_HISTOGRAM_BINS; ++i)
   {
     histogram_binlog_group_commit_values[i] =
       (histogram_binlog_group_commit.count_per_bin)[i];
@@ -9628,8 +9688,8 @@ SHOW_VAR status_vars[]= {
   {"Exec_seconds",             (char*) offsetof(STATUS_VAR, exec_time), SHOW_TIMER_STATUS},
   {"Flashcache_enabled",       (char*) &cachedev_enabled,       SHOW_BOOL },
   {"Flush_commands",           (char*) &refresh_version,        SHOW_LONG_NOFLUSH},
-  {"Git_hash",                 (char*) git_hash, SHOW_CHAR },
-  {"Git_date",                 (char*) git_date, SHOW_CHAR },
+  {"git_hash",                 (char*) git_hash, SHOW_CHAR },
+  {"git_date",                 (char*) git_date, SHOW_CHAR },
   {"Handler_commit",           (char*) offsetof(STATUS_VAR, ha_commit_count), SHOW_LONGLONG_STATUS},
   {"Handler_delete",           (char*) offsetof(STATUS_VAR, ha_delete_count), SHOW_LONGLONG_STATUS},
   {"Handler_discover",         (char*) offsetof(STATUS_VAR, ha_discover_count), SHOW_LONGLONG_STATUS},
@@ -9770,8 +9830,8 @@ SHOW_VAR status_vars[]= {
   {"Rpl_seconds_delete_rows",  (char*) &repl_event_times[DELETE_ROWS_EVENT],   SHOW_TIMER},
   {"Rpl_seconds_incident",     (char*) &repl_event_times[INCIDENT_EVENT],      SHOW_TIMER},
 #endif
-  {"Rocksdb_git_hash",         (char*) rocksdb_git_hash, SHOW_CHAR },
-  {"Rocksdb_git_date",         (char*) rocksdb_git_date, SHOW_CHAR },
+  {"rocksdb_git_hash",         (char*) rocksdb_git_hash, SHOW_CHAR },
+  {"rocksdb_git_date",         (char*) rocksdb_git_date, SHOW_CHAR },
   {"Select_full_join",         (char*) offsetof(STATUS_VAR, select_full_join_count), SHOW_LONGLONG_STATUS},
   {"Select_full_range_join",   (char*) offsetof(STATUS_VAR, select_full_range_join_count), SHOW_LONGLONG_STATUS},
   {"Select_range",             (char*) offsetof(STATUS_VAR, select_range_count), SHOW_LONGLONG_STATUS},
@@ -10822,6 +10882,8 @@ static int get_options(int *argc_ptr, char ***argv_ptr, my_bool logging)
   }
   /* Set global MyISAM variables from delay_key_write_options */
   fix_delay_key_write(0, 0, OPT_GLOBAL);
+
+  set_gap_lock_exception_list(0, 0, OPT_GLOBAL);
 
 #ifndef EMBEDDED_LIBRARY
   if (mysqld_chroot)

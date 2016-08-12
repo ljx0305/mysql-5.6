@@ -226,7 +226,7 @@ typedef Bitmap<((MAX_INDEXES+7)/8*8)> key_map; /* Used for finding keys */
 #define TEST_SIGINT		1024	/**< Allow sigint on threads */
 #define TEST_SYNCHRONIZATION    2048    /**< get server to do sleep in
                                            some places */
-#define HISTOGRAM_BUCKET_NAME_MAX_SIZE 16	/**< This is the maximum size
+#define HISTOGRAM_BUCKET_NAME_MAX_SIZE 64	/**< This is the maximum size
 						   of the string:
 						   "LowerBucketValue-"
 						   "UpperBucketValue<units>"
@@ -286,13 +286,6 @@ extern MYSQL_PLUGIN_IMPORT bool volatile abort_loop;
 extern bool in_bootstrap;
 extern my_bool opt_bootstrap;
 extern char *opt_rbr_idempotent_tables;
-/*
-  Global set of tables for which slave-exec-mode is considered IDEMPOTENT.
-  This is modified only during sql thread startup.
-
-  This set is accessed by sql threads.
-*/
-extern std::unordered_set<std::string> rbr_idempotent_tables;
 extern uint connection_count;
 extern ulong opt_srv_fatal_semaphore_timeout;
 extern my_bool opt_safe_user_create;
@@ -303,6 +296,7 @@ extern ulong slave_run_triggers_for_rbr;
 extern ulonglong slave_type_conversions_options;
 extern ulonglong admission_control_filter;
 extern my_bool read_only, opt_readonly, super_read_only, opt_super_readonly;
+extern char* opt_read_only_error_msg_extra;
 extern my_bool send_error_before_closing_timed_out_connection;
 extern my_bool allow_document_type;
 extern my_bool block_create_myisam;
@@ -619,14 +613,22 @@ static inline void my_io_perf_sum_atomic_helper(
 }
 
 /* Histogram struct to track various latencies */
-#define NUMBER_OF_HISTOGRAM_BINS 15
+#define NUMBER_OF_HISTOGRAM_BINS 10
 struct latency_histogram {
   size_t num_bins;
   ulonglong step_size;
+  double step_ratio;
   ulonglong count_per_bin[NUMBER_OF_HISTOGRAM_BINS];
 };
 
-typedef latency_histogram counter_histogram;
+
+#define NUMBER_OF_COUNTER_HISTOGRAM_BINS 15
+struct counter_histogram {
+  size_t num_bins;
+  ulonglong step_size;
+  ulonglong count_per_bin[NUMBER_OF_COUNTER_HISTOGRAM_BINS];
+};
+
 
 /**
   Create a new Histogram.
@@ -638,7 +640,7 @@ typedef latency_histogram counter_histogram;
 void latency_histogram_init(latency_histogram* current_histogram,
                     const char* step_size_with_unit);
 
-void counter_histogram_init(latency_histogram* current_histogram,
+void counter_histogram_init(counter_histogram* current_histogram,
                             ulonglong step_value);
 
 /**
@@ -652,7 +654,7 @@ void counter_histogram_init(latency_histogram* current_histogram,
 */
 void latency_histogram_increment(latency_histogram* current_histogram,
                                    ulonglong value, ulonglong count);
-void counter_histogram_increment(latency_histogram* current_histogram,
+void counter_histogram_increment(counter_histogram* current_histogram,
                                  ulonglong value);
 /**
   Get the count corresponding to a bin of the Histogram.
@@ -723,6 +725,7 @@ void prepare_counter_histogram_vars(latency_histogram* current_histogram,
    Frees old histogram bucket display strings before assigning new ones.
 */
 void free_latency_histogram_sysvars(SHOW_VAR* latency_histogram_data);
+void free_counter_histogram_sysvars(SHOW_VAR* counter_histogram_data);
 
 /* Fetches table stats for a given table */
 struct TABLE;

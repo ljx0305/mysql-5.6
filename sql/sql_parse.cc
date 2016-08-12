@@ -3137,13 +3137,15 @@ mysql_execute_command(THD *thd,
     */
     if (deny_updates_if_read_only_option(thd, all_tables))
     {
+      std::string extra_info;
+      int nr = get_active_master_info(&extra_info);
       if (opt_super_readonly)
       {
-        my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--read-only (super)");
+        my_error(nr, MYF(0), "--read-only (super)", extra_info.c_str());
       }
       else
       {
-        my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--read-only");
+        my_error(nr, MYF(0), "--read-only", extra_info.c_str());
       }
       DBUG_RETURN(-1);
     }
@@ -4132,13 +4134,15 @@ end_with_restore_list:
         break;
       if (check_ro(thd) && some_non_temp_table_to_be_updated(thd, all_tables))
       {
+        std::string extra_info;
+        int nr = get_active_master_info(&extra_info);
         if (opt_super_readonly)
         {
-          my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--read-only (super)");
+          my_error(nr, MYF(0), "--read-only (super)", extra_info.c_str());
         }
         else
         {
-          my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--read-only");
+          my_error(nr, MYF(0), "--read-only", extra_info.c_str());
         }
 	break;
       }
@@ -7326,14 +7330,11 @@ bool AC::admission_control_enter(THD* thd, const std::string& entity) {
     mysql_rwlock_unlock(&LOCK_ac);
   }
   thd->proc_info = prev_proc_info;
-  if (!error)
-    ++total_running_queries;
   return error;
 }
 
 void AC::wait_for_signal(THD* thd, std::shared_ptr<st_ac_node>& ac_node,
                          std::shared_ptr<Ac_info> ac_info) {
-  ++total_waiting_queries;
   PSI_stage_info old_stage;
   mysql_mutex_lock(&ac_node->lock);
   /**
@@ -7352,7 +7353,6 @@ void AC::wait_for_signal(THD* thd, std::shared_ptr<st_ac_node>& ac_node,
   // Spurious wake-ups are rare and fine in this design.
   mysql_cond_wait(&ac_node->cond, &ac_node->lock);
   thd->EXIT_COND(&old_stage);
-  --total_waiting_queries;
 }
 
 /**
@@ -7387,7 +7387,6 @@ void AC::admission_control_exit(THD* thd, const std::string& entity) {
   }
   mysql_rwlock_unlock(&LOCK_ac);
   thd->proc_info = prev_proc_info;
-  --total_running_queries;
 }
 
 /*
@@ -9904,4 +9903,31 @@ THD* get_opt_thread_with_data_lock(THD *thd, ulong thread_id)
     my_error(ER_NO_SUCH_THREAD, MYF(0), thread_id);
 
   return ret_thd;
+}
+
+// This function will generate the string containing current master host and
+// port info if available.
+//
+// Return value:
+//   ER_OPTION_PREVENTS_STATEMENT_EXTRA_INFO, if master info is available.
+//   ER_OPTION_PREVENTS_STATEMENT, if master info is not available.
+int get_active_master_info(std::string *str_ptr)
+{
+#ifdef HAVE_REPLICATION
+    if (str_ptr && active_mi && active_mi->host && active_mi->host[0])
+    {
+      *str_ptr = "Current master_host: ";
+      *str_ptr += active_mi->host;
+      *str_ptr += ", master_port: ";
+      *str_ptr += std::to_string(active_mi->port);
+      const char *extra_str = opt_read_only_error_msg_extra;
+      if (extra_str && extra_str[0])
+      {
+        *str_ptr += ". ";
+        *str_ptr += extra_str;
+      }
+      return ER_OPTION_PREVENTS_STATEMENT_EXTRA_INFO;
+    }
+#endif
+    return ER_OPTION_PREVENTS_STATEMENT;
 }

@@ -263,7 +263,7 @@ net_send_ok(THD *thd,
             ulonglong affected_rows, ulonglong id, const char *message)
 {
   NET *net= &thd->net;
-  uchar buff[MYSQL_ERRMSG_SIZE+10],*pos;
+  uchar buff[MYSQL_ERRMSG_SIZE+12+Gtid::MAX_TEXT_LENGTH],*pos;
   bool error= FALSE;
   DBUG_ENTER("net_send_ok");
 
@@ -276,6 +276,10 @@ net_send_ok(THD *thd,
   buff[0]=0;					// No fields
   pos=net_store_length(buff+1,affected_rows);
   pos=net_store_length(pos, id);
+  if (thd->variables.session_track_gtids != OFF &&
+      (thd->client_capabilities & CLIENT_SESSION_TRACK) &&
+      thd->get_trans_gtid())
+    server_status |= SERVER_SESSION_STATE_CHANGED;
   if (thd->client_capabilities & CLIENT_PROTOCOL_41)
   {
     DBUG_PRINT("info",
@@ -299,7 +303,16 @@ net_send_ok(THD *thd,
   }
   thd->get_stmt_da()->set_overwrite_status(true);
 
-  if (message && message[0])
+  if (thd->variables.session_track_gtids != OFF &&
+      (thd->client_capabilities & CLIENT_SESSION_TRACK))
+  {
+    /* the info field */
+    pos= net_store_data(pos, (uchar*) message, message ? strlen(message) : 0);
+    /* gtid */
+    const char *gtid= thd->get_trans_gtid();
+    pos= net_store_data(pos, (uchar*) gtid, gtid ? strlen(gtid) : 0);
+  }
+  else if (message && message[0])
     pos= net_store_data(pos, (uchar*) message, strlen(message));
   error= my_net_write(net, buff, (size_t) (pos-buff));
   if (!error)
@@ -756,7 +769,7 @@ store_result_set_metadata_object_names(THD *thd,
     in the result set metadata if the appropriate protocol mode is
     set. Otherwise, use standard metadata.
   */
-  if (thd->variables.protocol_mode & PROTO_MODE_MINIMAL_OBJECT_NAMES_IN_RSMD)
+  if (thd->variables.protocol_mode == PROTO_MODE_MINIMAL_OBJECT_NAMES_IN_RSMD)
     metadata= minimal_metadata;
   else
     metadata= standard_metadata;

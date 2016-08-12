@@ -40,6 +40,7 @@
 
 /* MyRocks header files */
 #include "./rdb_perf_context.h"
+#include "./rdb_sst_info.h"
 #include "./rdb_utils.h"
 
 /**
@@ -116,6 +117,21 @@ const char * const PER_INDEX_CF_NAME = "$per_index_cf";
 
 #define DEFAULT_SUBCOMPACTIONS                           1
 #define MAX_SUBCOMPACTIONS                               64
+
+/*
+  Defines the field sizes for serializing XID object to a string representation.
+  string byte format: [field_size: field_value, ...]
+  [
+    8: XID.formatID,
+    1: XID.gtrid_length,
+    1: XID.bqual_length,
+    XID.gtrid_length + XID.bqual_length: XID.data
+  ]
+*/
+#define RDB_FORMATID_SZ 8
+#define RDB_GTRID_SZ 1
+#define RDB_BQUAL_SZ 1
+#define RDB_XIDHDR_LEN (RDB_FORMATID_SZ + RDB_GTRID_SZ + RDB_BQUAL_SZ)
 
 /*
   To fix an unhandled exception we specify the upper bound as LONGLONGMAX
@@ -232,6 +248,8 @@ struct st_export_stats {
 
 }  // namespace myrocks
 
+#include "./rdb_buff.h"
+
 /* Provide hash function for GL_INDEX_ID so we can include it in sets */
 namespace std {
   template <>
@@ -307,15 +325,8 @@ class ha_rocksdb: public my_core::handler
   */
   uchar *m_end_key_packed_tuple;
 
-  /*
-    Same as above, but it stores the value part. It holds unpack info which
-    is currently not used (always empty).
-
-    TODO: why does ha_rocksdb::open() assume that an upper bound of the size of
-    this buffer is max_packed_sk_len? This is technically true currently,
-    but doesn't look meaningful.
-  */
-  uchar *m_sk_tails;
+  Rdb_string_writer m_sk_tails;
+  Rdb_string_writer m_pk_unpack_info;
 
   /*
     ha_rockdb->index_read_map(.. HA_READ_KEY_EXACT or similar) will save here
@@ -329,7 +340,7 @@ class ha_rocksdb: public my_core::handler
 
   /* Second buffers, used by UPDATE. */
   uchar *m_sk_packed_tuple_old;
-  uchar *m_sk_tails_old;
+  Rdb_string_writer m_sk_tails_old;
 
   /*
     Temporary space for packing VARCHARs (we provide it to
@@ -372,15 +383,19 @@ class ha_rocksdb: public my_core::handler
   my_core::key_map m_update_scope;
   bool m_update_scope_is_valid;
 
+  /* SST information used for bulk loading the primary key */
+  std::shared_ptr<Rdb_sst_info> m_sst_info;
+
   /*
     MySQL index number for duplicate key error
   */
   int m_dupp_errkey;
 
-  int create_key_defs(TABLE *table_arg, const char *db_table, const uint len,
-                      HA_CREATE_INFO *create_info, Rdb_tbl_def *tbl_def_arg,
-                      Rdb_tbl_def *old_tbl_def_arg= nullptr)
-      __attribute__((__nonnull__(2, 3, 5, 6), __warn_unused_result__));
+  int create_key_defs(const TABLE *table_arg, const std::string& db_table,
+                      Rdb_tbl_def *tbl_def_arg,
+                      const TABLE *old_table_arg= nullptr,
+                      const Rdb_tbl_def *old_tbl_def_arg= nullptr)
+      __attribute__((__nonnull__(2, 4), __warn_unused_result__));
   int secondary_index_read(const int keyno, uchar *buf)
       __attribute__((__nonnull__, __warn_unused_result__));
   void setup_iterator_for_rnd_scan();
@@ -470,6 +485,9 @@ class ha_rocksdb: public my_core::handler
 
   void get_storage_type(Rdb_field_encoder *encoder, uint kp);
   void setup_field_converters();
+  int alloc_key_buffers(const TABLE* table_arg, const Rdb_tbl_def* tbl_def_arg)
+    __attribute__((__nonnull__, __warn_unused_result__));
+  void free_key_buffers();
 
   // the buffer size should be at least 2*Rdb_key_def::INDEX_NUMBER_SIZE
   rocksdb::Range get_range(int i, uchar buf[]) const;
@@ -489,11 +507,6 @@ class ha_rocksdb: public my_core::handler
     Update stats
   */
   void update_stats(void);
-
-  /*
-    Helper for convert_record_to_storage_format for writing unpack_info.
-  */
-  void write_unpack_info(void);
 
 public:
   /*
@@ -587,8 +600,17 @@ public:
     __attribute__((__nonnull__, __warn_unused_result__));
 
   void convert_record_to_storage_format(const rocksdb::Slice& pk_packed_slice,
+                                        Rdb_string_writer *pk_unpack_info,
                                         rocksdb::Slice *packed_rec)
     __attribute__((__nonnull__));
+
+  static const char* get_key_name(const uint index, const TABLE* table_arg,
+                                  const Rdb_tbl_def* tbl_def_arg)
+    __attribute__((__nonnull__, __warn_unused_result__));
+
+  static const char* get_key_comment(const uint index, const TABLE* table_arg,
+                                     const Rdb_tbl_def* tbl_def_arg)
+    __attribute__((__nonnull__, __warn_unused_result__));
 
   static bool is_hidden_pk(const uint index, const TABLE* table_arg,
                            const Rdb_tbl_def* tbl_def_arg)
@@ -653,8 +675,7 @@ public:
     __attribute__((__warn_unused_result__));;
 
   virtual double scan_time() { return (double) (stats.records+stats.deleted) / 20.0+10; }
-  virtual double read_time(uint, uint, ha_rows rows)
-  { return (double) rows /  20.0+1; }
+  virtual double read_time(uint, uint, ha_rows rows) override;
 
   int open(const char *name, int mode, uint test_if_locked)
     __attribute__((__warn_unused_result__));
@@ -697,23 +718,42 @@ private:
     const uchar*     old_data;
     rocksdb::Slice   new_pk_slice;
     rocksdb::Slice   old_pk_slice;
+
+    // "unpack_info" data for the new PK value
+    Rdb_string_writer *new_pk_unpack_info;
+
     longlong         hidden_pk_id;
     bool             skip_unique_check;
   };
 
-  int create_cfs(TABLE *table_arg, const char *db_table,
+  int create_cfs(const TABLE *table_arg, const std::string& db_table,
                  Rdb_tbl_def *tbl_def_arg,
                  std::array<struct key_def_cf_info, MAX_INDEXES + 1>* cfs);
+    __attribute__((__nonnull__, __warn_unused_result__));
 
 
-  int create_key_def(TABLE *table_arg, uint i, const Rdb_tbl_def* tbl_def_arg,
+  int create_key_def(const TABLE *table_arg, uint i,
+                     const Rdb_tbl_def* tbl_def_arg,
                      std::shared_ptr<Rdb_key_def>* new_key_def,
                      const struct key_def_cf_info& cf_info);
+    __attribute__((__nonnull__, __warn_unused_result__));
 
-  int create_inplace_key_defs(TABLE *table_arg,
+  int create_inplace_key_defs(const TABLE *table_arg,
                        Rdb_tbl_def *tbl_def_arg,
-                       Rdb_tbl_def *old_tbl_def_arg,
+                       const TABLE *old_table_arg,
+                       const Rdb_tbl_def *old_tbl_def_arg,
                        const std::array<key_def_cf_info, MAX_INDEXES + 1>& cfs);
+    __attribute__((__nonnull__, __warn_unused_result__));
+
+  std::unordered_map<std::string, uint> get_old_key_positions(
+                      const TABLE* table_arg,
+                      const Rdb_tbl_def* tbl_def_arg,
+                      const TABLE* old_table_arg,
+                      const Rdb_tbl_def* old_tbl_def_arg)
+    __attribute__((__nonnull__));
+
+  int compare_key_parts(const KEY* old_key, const KEY* new_key);
+    __attribute__((__nonnull__, __warn_unused_result__));
 
   int index_first_intern(uchar *buf)
     __attribute__((__nonnull__, __warn_unused_result__));
@@ -731,15 +771,29 @@ private:
   int get_pk_for_update(struct update_row_info* row_info);
   int check_and_lock_unique_pk(uint key_id,
                                const struct update_row_info& row_info,
-                               bool* found, bool* pk_changed);
+                               bool* found, bool* pk_changed)
+    __attribute__((__warn_unused_result__));
   int check_and_lock_sk(uint key_id, const struct update_row_info& row_info,
-                        bool* found) const;
+                        bool* found) const
+    __attribute__((__warn_unused_result__));
   int check_uniqueness_and_lock(const struct update_row_info& row_info,
-                                bool* pk_changed);
+                                bool* pk_changed)
+    __attribute__((__warn_unused_result__));
+  bool over_bulk_load_threshold(int* err)
+    __attribute__((__warn_unused_result__));
+  int bulk_load_pk(Rdb_transaction* tx, uint key_id,
+                   rocksdb::ColumnFamilyHandle* cf, const rocksdb::Slice& key,
+                   const rocksdb::Slice& value)
+    __attribute__((__nonnull__, __warn_unused_result__));
   int update_pk(uint key_id, const struct update_row_info& row_info,
-                bool pk_changed);
-  int update_sk(uint key_id, const struct update_row_info& row_info);
-  int update_indexes(const struct update_row_info& row_info, bool pk_changed);
+                bool pk_changed)
+    __attribute__((__warn_unused_result__));
+  int update_sk(const TABLE* table_arg,
+                const std::shared_ptr<const Rdb_key_def>& kd,
+                const struct update_row_info& row_info)
+    __attribute__((__warn_unused_result__));
+  int update_indexes(const struct update_row_info& row_info, bool pk_changed)
+    __attribute__((__warn_unused_result__));
 
   int read_key_exact(const std::shared_ptr<const Rdb_key_def>& kd,
                      rocksdb::Iterator* iter, bool using_full_key,
@@ -785,6 +839,10 @@ private:
     __attribute__((__nonnull__));
   bool contains_foreign_key(THD* thd)
     __attribute__((__nonnull__, __warn_unused_result__));
+
+  int inplace_populate_sk(const TABLE* table_arg,
+      const std::unordered_set<std::shared_ptr<Rdb_key_def>>& indexes);
+
 public:
   int index_init(uint idx, bool sorted) __attribute__((__warn_unused_result__));
   int index_end() __attribute__((__warn_unused_result__));
@@ -883,6 +941,8 @@ public:
                                   my_core::Alter_inplace_info *ha_alter_info,
                                   bool commit);
 
+  int finalize_bulk_load() __attribute__((__warn_unused_result__));
+
  public:
   virtual void rpl_before_delete_rows() override;
   virtual void rpl_after_delete_rows() override;
@@ -919,8 +979,14 @@ struct Rdb_inplace_alter_ctx : public my_core::inplace_alter_handler_ctx
   /* Stores the new number of key definitions */
   const uint m_new_n_keys;
 
+  /* Stores the added key glids */
+  std::unordered_set<std::shared_ptr<Rdb_key_def>> m_added_indexes;
+
   /* Stores the dropped key glids */
   std::unordered_set<GL_INDEX_ID> m_dropped_index_ids;
+
+  /* Stores number of keys to add */
+  const uint m_n_added_keys;
 
   /* Stores number of keys to drop */
   const uint m_n_dropped_keys;
@@ -928,12 +994,16 @@ struct Rdb_inplace_alter_ctx : public my_core::inplace_alter_handler_ctx
   Rdb_inplace_alter_ctx(
       Rdb_tbl_def* new_tdef, std::shared_ptr<Rdb_key_def>* old_key_descr,
       std::shared_ptr<Rdb_key_def>* new_key_descr, uint old_n_keys,
-      uint new_n_keys, std::unordered_set<GL_INDEX_ID> dropped_index_ids,
-      uint n_dropped_keys) :
+      uint new_n_keys,
+      std::unordered_set<std::shared_ptr<Rdb_key_def>> added_indexes,
+      std::unordered_set<GL_INDEX_ID> dropped_index_ids,
+      uint n_added_keys, uint n_dropped_keys) :
     my_core::inplace_alter_handler_ctx(), m_new_tdef(new_tdef),
     m_old_key_descr(old_key_descr), m_new_key_descr(new_key_descr),
     m_old_n_keys(old_n_keys), m_new_n_keys(new_n_keys),
+    m_added_indexes(added_indexes),
     m_dropped_index_ids(dropped_index_ids),
+    m_n_added_keys(n_added_keys),
     m_n_dropped_keys(n_dropped_keys)
   {
   }
